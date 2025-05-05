@@ -63,7 +63,7 @@ const createIndex = async (indexName, data) => {
                         index: {
                             knn: true,
                             'knn.algo_param.ef_search': 100,
-                            'knn.space_type': 'l2'
+                            'knn.space_type': 'cosinesimil'
                         }
                     },
                     mappings
@@ -244,18 +244,18 @@ const storeEntity = async (entity, appUrl, entityType) => {
 
         const document = {
             id: entity.id,
-            file_name: entity.file_name || '',
-            file_type: entity.file_type || '',
-            description: entity.description || '',
-            content_text: entity.content_text || '',
+            file_name: entity.file_name?.toLowerCase() || '',
+            file_type: entity.file_type?.toLowerCase() || '',
+            description: entity.description?.toLowerCase() || '',
+            content_text: entity.content_text?.toLowerCase() || '',
             preview_url: entity.preview_url || '',
             application_url: appUrl,
             entity_type: entityType,
             embedding: embeddingArray,
             metadata: {
-                author: entity.metadata?.author || '',
-                tags: entity.metadata?.tags || [],
-                category: entity.metadata?.category || ''
+                author: entity.metadata?.author?.toLowerCase() || '',
+                tags: entity.metadata?.tags?.map(tag => tag.toLowerCase()) || [],
+                category: entity.metadata?.category?.toLowerCase() || ''
             },
             createdAt: new Date().toISOString(),
             updatedAt: new Date().toISOString()
@@ -305,16 +305,17 @@ const updateEntity = async (id, entity, appUrl, entityType) => {
     try {
         const indexName = generateIndexName(appUrl, entityType);
         
+        // Convert all string fields to lowercase
         const document = {
-            file_name: entity.file_name,
-            file_type: entity.file_type,
-            description: entity.description,
-            content_text: entity.content_text,
-            preview_url: entity.preview_url,
+            file_name: entity.file_name?.toLowerCase() || '',
+            file_type: entity.file_type?.toLowerCase() || '',
+            description: entity.description?.toLowerCase() || '',
+            content_text: entity.content_text?.toLowerCase() || '',
+            preview_url: entity.preview_url || '',
             metadata: {
-                author: entity.metadata.author,
-                tags: entity.metadata.tags,
-                category: entity.metadata.category
+                author: entity.metadata?.author?.toLowerCase() || '',
+                tags: entity.metadata?.tags?.map(tag => tag.toLowerCase()) || [],
+                category: entity.metadata?.category?.toLowerCase() || ''
             },
             updatedAt: new Date().toISOString()
         };
@@ -406,6 +407,93 @@ const getEntity = async (id, appUrl, entityType) => {
     }
 };
 
+const searchEntities = async (searchParams, appUrl, entityType) => {
+    try {
+        const indexName = generateIndexName(appUrl, entityType);
+        const { text, filters = {}, page = 1, limit = 10 } = searchParams;
+
+        let query;
+        
+        if (text) {
+            // Generate embeddings for semantic search
+            const { generateEmbeddings } = require('../services/aws/bedrock');
+            const embedding = await generateEmbeddings(text);
+
+            // Combine semantic search with text search for better results
+            query = {
+                bool: {
+                    should: [
+                        {
+                            knn: {
+                                embedding: {
+                                    vector: embedding,
+                                    k: limit * 2 // Increase k to get more candidates
+                                }
+                            }
+                        },
+                        {
+                            multi_match: {
+                                query: text,
+                                fields: [
+                                    "content_text^3",  // Higher weight for content
+                                    "description^2",   // Medium weight for description
+                                    "file_name",       // Normal weight for filename
+                                    "metadata.*"       // Search in all metadata fields
+                                ],
+                                fuzziness: "AUTO"     // Handle typos
+                            }
+                        }
+                    ],
+                    minimum_should_match: 1
+                }
+            };
+
+            // Add filters if present
+            if (Object.keys(filters).length > 0) {
+                query.bool.filter = Object.entries(filters).map(([field, value]) => ({
+                    match: { [field]: value }
+                }));
+            }
+        } else {
+            // Keyword-based search with filters only
+            query = {
+                bool: {
+                    must: Object.entries(filters).map(([field, value]) => ({
+                        match: { [field]: value }
+                    }))
+                }
+            };
+        }
+
+        const response = await client.search({
+            index: indexName,
+            body: {
+                query,
+                from: (page - 1) * limit,
+                size: limit,
+                min_score: 0.1, // Minimum relevance threshold
+                sort: text ? ["_score"] : ["_doc"] // Sort by relevance for text search
+            }
+        });
+
+        return {
+            success: true,
+            total: response.body.hits.total.value,
+            hits: response.body.hits.hits.map(hit => ({
+                ...hit._source,
+                score: hit._score,
+                relevance: (hit._score / response.body.hits.max_score).toFixed(2) // Normalized relevance score
+            }))
+        };
+    } catch (error) {
+        console.error('Error searching entities:', error);
+        return {
+            success: false,
+            error: error.message
+        };
+    }
+};
+
 // Update the exports
 module.exports = {
     client,
@@ -415,5 +503,6 @@ module.exports = {
     updateEntity,
     deleteEntity,
     storeBulkEntities,
-    getEntity
+    getEntity,
+    searchEntities
 };

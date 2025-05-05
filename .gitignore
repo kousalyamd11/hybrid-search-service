@@ -1,5 +1,28 @@
+# Dependencies
 node_modules/
+
+# Environment variables
 .env
-opensearch-data
-mongo-data
+.env.local
+.env.*.local
+
+# Data directories
+opensearch-data/
+mongo-data/
+logs/
+
+# OS files
 .DS_Store
+Thumbs.db
+
+# IDE files
+.idea/
+.vscode/
+
+# Logs
+*.log
+npm-debug.log*
+
+# Build output
+dist/
+build/

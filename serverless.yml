@@ -1,0 +1,27 @@
+service: hybrid-search-service
+
+provider:
+  name: aws
+  runtime: nodejs18.x
+  stage: ${opt:stage, 'dev'}
+  region: ${opt:region, 'us-east-1'}
+
+plugins:
+  - serverless-offline
+
+functions:
+  search:
+    handler: src/lambdas/search/index.handler
+    events:
+      - http:
+          path: search
+          method: post
+          cors: true
+  
+  analytics:
+    handler: src/lambdas/analytics/index.handler
+    events:
+      - http:
+          path: analytics
+          method: get
+          cors: true
