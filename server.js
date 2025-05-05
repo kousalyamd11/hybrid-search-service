@@ -1,22 +1,40 @@
-// Load environment variables from .env file
-require('dotenv').config();
+const path = require('path');
+const dotenv = require('dotenv');
+const result = dotenv.config({ path: path.resolve(__dirname, '.env') });
 
-// Import core libraries and SDKs
-const express = require('express'); // Web framework
-const jwt = require('jsonwebtoken'); // JSON Web Token for authentication
-const { MongoClient } = require('mongodb'); // MongoDB client for logs
-const { BedrockRuntimeClient, InvokeModelCommand } = require('@aws-sdk/client-bedrock-runtime'); // AWS Bedrock for embeddings and Claude
-const { Client } = require('@opensearch-project/opensearch'); // OpenSearch client
-const axios = require('axios'); // Axios for HTTP file downloads
+if (result.error) {
+  console.error('Error loading .env file:', result.error);
+}
 
-// Initialize Express app
+console.log('Environment variables loaded:');
+console.log('- JWT_SECRET:', process.env.JWT_SECRET ? 'Set ✓' : 'Not set ✗');
+console.log('- AWS_REGION:', process.env.AWS_REGION ? 'Set ✓' : 'Not set ✗');
+console.log('- OPENSEARCH_HOST:', process.env.OPENSEARCH_HOST ? 'Set ✓' : 'Not set ✗');
+
+const express = require('express');
+const cors = require('cors');
+const jwt = require('jsonwebtoken');
+const { MongoClient } = require('mongodb');
+const { BedrockRuntimeClient, InvokeModelCommand } = require('@aws-sdk/client-bedrock-runtime');
+const { Client } = require('@opensearch-project/opensearch');
+const axios = require('axios');
+const sharp = require('sharp');
+
 const app = express();
-app.use(express.json()); // Enable JSON body parsing
+app.use(cors());
+app.use(express.json());
 
-// Initialize OpenSearch client
-const opensearchClient = new Client({ node: process.env.OPENSEARCH_HOST });
+const opensearchClient = new Client({ 
+  node: process.env.OPENSEARCH_HOST || 'https://localhost:9200',
+  auth: {
+    username: process.env.OPENSEARCH_USERNAME || 'admin',
+    password: process.env.OPENSEARCH_PASSWORD || 'admin'
+  },
+  ssl: {
+    rejectUnauthorized: false
+  }
+});
 
-// Initialize AWS Bedrock client
 const bedrockClient = new BedrockRuntimeClient({
   region: process.env.AWS_REGION,
   credentials: {
@@ -27,15 +45,13 @@ const bedrockClient = new BedrockRuntimeClient({
 
 console.log(`Initializing Bedrock client in region: ${process.env.AWS_REGION}`);
 
-// MongoDB connection configuration
 const mongoUrl = 'mongodb://localhost:27017/search_logs';
 const dbName = process.env.DB_NAME || 'search_logs';
 const collectionName = process.env.COLLECTION_NAME || 'requests';
 const mongoClient = new MongoClient(mongoUrl);
 
-let dbConnection; // Placeholder for MongoDB connection
+let dbConnection;
 
-// Connect to MongoDB at startup
 (async () => {
   try {
     await mongoClient.connect();
@@ -47,12 +63,10 @@ let dbConnection; // Placeholder for MongoDB connection
   }
 })();
 
-// Helper: Build standardized index name from client/app context
 const getIndexName = (clientname, appname, stack, entityType) => {
   return `${clientname}_${appname}_${stack}-${entityType}`.toLowerCase().replace(/[^a-z0-9_-]/g, '_');
 };
 
-// Helper function for logging OpenSearch operations
 const logOpenSearchOperation = async (operationType, indexName, status, details) => {
   await createLogEntry({
     timestamp: new Date(),
@@ -64,7 +78,6 @@ const logOpenSearchOperation = async (operationType, indexName, status, details)
   });
 };
 
-// Helper function for logging entity operations
 const logEntityOperation = async (operationType, entityData, status, error = null) => {
   const logData = {
     timestamp: new Date(),
@@ -85,7 +98,6 @@ const logEntityOperation = async (operationType, entityData, status, error = nul
   await createLogEntry(logData);
 };
 
-// Helper function for logging index operations
 const logIndexOperation = async (operation, indexName, status, details = null) => {
   const logData = {
     timestamp: new Date(),
@@ -102,7 +114,6 @@ const logIndexOperation = async (operation, indexName, status, details = null) =
   await createLogEntry(logData);
 };
 
-// Update the existing ensureIndexWithMapping function to include logging
 const ensureIndexWithMapping = async (indexName) => {
   try {
     const exists = await opensearchClient.indices.exists({ index: indexName });
@@ -133,7 +144,6 @@ const ensureIndexWithMapping = async (indexName) => {
   }
 };
 
-// Insert a log entry into MongoDB
 const createLogEntry = async (logData) => {
   if (!dbConnection) throw new Error('Database connection not established');
   const collection = dbConnection.collection(collectionName);
@@ -144,7 +154,6 @@ const createLogEntry = async (logData) => {
   });
 };
 
-// Extract text using Anthropic Claude model via Bedrock
 const extractTextWithClaude = async (filePath, fileType) => {
   try {
     if (fileType === 'image') {
@@ -183,7 +192,6 @@ const extractTextWithClaude = async (filePath, fileType) => {
   }
 };
 
-// Generate embedding from text using AWS Bedrock Titan model
 const createEmbedding = async (text, dimension = 1024) => {
   if (!text || typeof text !== 'string' || text.trim().length === 0) {
     throw new Error('Input text is empty or invalid. Cannot generate embedding.');
@@ -208,28 +216,43 @@ const createEmbedding = async (text, dimension = 1024) => {
   }
 };
 
-// Middleware to validate JWT token from Authorization header
 const validateJWT = (req, res, next) => {
   const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith('Bearer '))
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    console.error('Authorization header missing or malformed');
     return res.status(401).json({ error: 'Unauthorized: Missing or invalid token' });
+  }
+  
+  const token = authHeader.split(' ')[1];
   try {
-    const decoded = jwt.verify(authHeader.split(' ')[1], process.env.JWT_SECRET);
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
     req.user = decoded;
     req.headers.clientname = decoded.clientname;
     req.headers.appname = decoded.appname;
     req.headers.stack = decoded.stack;
     req.headers.appurl = decoded.appurl;
     next();
-  } catch {
+  } catch (err) {
+    console.error('JWT verification failed:', err.message);
     return res.status(401).json({ error: 'Unauthorized: Invalid token' });
   }
 };
 
-// Generate JWT token with expiration
-const generateToken = (payload, expiresIn) => jwt.sign(payload, process.env.JWT_SECRET, { expiresIn });
+const generateToken = (payload, expiresIn) => {
+  if (!process.env.JWT_SECRET) {
+    console.error('JWT_SECRET environment variable is not set in the environment');
+    console.log('Available environment variables:', Object.keys(process.env));
+  }
+  
+  const secret = process.env.JWT_SECRET;
+  if (!secret) {
+    console.warn('WARNING: Using default JWT secret. This is not secure for production!');
+    return jwt.sign(payload, 'default_development_secret_key', { expiresIn });
+  }
+  
+  return jwt.sign(payload, secret, { expiresIn });
+};
 
-// POST /auth
 app.post('/auth', async (req, res) => {
   const { clientname, appname, stack, appurl } = req.body;
   if (!clientname || !appname || !stack || !appurl)
@@ -245,21 +268,34 @@ app.post('/auth', async (req, res) => {
   }
 });
 
-// -------------------
-// POST /entity
-// -------------------
 app.post('/entity', validateJWT, async (req, res) => {
   const { clientname, appname, stack, appurl } = req.headers;
   const { entityType, metadata, filePath, fileType } = req.body;
+  
+  if (!entityType || !metadata || !metadata.id) {
+    return res.status(400).json({ error: 'Missing required fields', details: 'entityType, metadata.id are required' });
+  }
+  
   const indexName = getIndexName(clientname, appname, stack, entityType);
   const timestamp = new Date();
   let embedding;
+  let extractedText; // Store extracted text for images
   try {
     await ensureIndexWithMapping(indexName);
     try {
       if (fileType === 'image' || fileType === 'pdf' || fileType === 'video') {
-        const extractedText = await extractTextWithClaude(filePath, fileType);
+        if (!filePath) {
+          return res.status(400).json({ error: 'Missing filePath', details: 'filePath is required for image, pdf, and video file types' });
+        }
+        
+        extractedText = await extractTextWithClaude(filePath, fileType);
         embedding = await createEmbedding(extractedText);
+        
+        // If no description is provided, use Claude's extracted text as the description
+        if (!metadata.description || metadata.description.trim() === '') {
+          console.log('No description provided, using Claude\'s extracted text as description');
+          metadata.description = extractedText;
+        }
       } else {
         const inputText = [
           metadata.name || '',
@@ -291,6 +327,7 @@ app.post('/entity', validateJWT, async (req, res) => {
       embedding,
       fileType,
       filePath,
+      text: extractedText || null, // Store extracted text for images, PDFs, videos
       createdAt: timestamp
     };
     await opensearchClient.index({
@@ -329,12 +366,187 @@ app.post('/entity', validateJWT, async (req, res) => {
   }
 });
 
-// -------------------
-// POST /search
-// -------------------
+app.put('/entity/:id', validateJWT, async (req, res) => {
+  const { clientname, appname, stack, appurl } = req.headers;
+  const { entityType, metadata, filePath, fileType } = req.body;
+  const entityId = req.params.id;
+  const timestamp = new Date();
+
+  if (!entityType || !metadata) {
+    return res.status(400).json({ error: 'Missing required fields' });
+  }
+
+  const indexName = getIndexName(clientname, appname, stack, entityType);
+
+  try {
+    const existingEntity = await opensearchClient.get({
+      index: indexName,
+      id: entityId
+    }).catch(() => null);
+
+    if (!existingEntity) {
+      return res.status(404).json({
+        error: 'Entity not found',
+        details: {
+          id: entityId,
+          suggestion: 'Please verify the entity ID and ensure it exists'
+        }
+      });
+    }
+
+    let embedding;
+    let extractedText; // Store extracted text for images
+    try {
+      if (fileType === 'image' || fileType === 'pdf' || fileType === 'video') {
+        if (!filePath) {
+          return res.status(400).json({ error: 'Missing filePath for media type' });
+        }
+        extractedText = await extractTextWithClaude(filePath, fileType);
+        embedding = await createEmbedding(extractedText);
+      } else {
+        const inputText = [metadata.name || '', metadata.description || ''].filter(text => text.trim()).join(' ');
+        if (!inputText) {
+          return res.status(400).json({ error: 'Missing text content for embedding' });
+        }
+        embedding = await createEmbedding(inputText);
+      }
+    } catch (embeddingError) {
+      await createLogEntry({
+        timestamp,
+        clientname,
+        appname,
+        stack,
+        appurl,
+        entityType,
+        event: 'embedding_failure',
+        status: 'failure',
+        entityId,
+        error: embeddingError.message
+      });
+      return res.status(500).json({ error: 'Failed to create embedding', details: embeddingError.message });
+    }
+
+    const document = {
+      ...metadata,
+      embedding,
+      fileType,
+      filePath,
+      text: extractedText || null, // Store extracted text for images, PDFs, videos
+      updatedAt: timestamp
+    };
+
+    await opensearchClient.update({
+      index: indexName,
+      id: entityId,
+      body: { doc: document },
+      refresh: true
+    });
+
+    await createLogEntry({
+      timestamp,
+      clientname,
+      appname,
+      stack,
+      appurl,
+      entityType,
+      event: 'entity_updated',
+      status: 'success',
+      entityId
+    });
+
+    res.status(200).json({ message: 'Entity updated successfully', id: entityId });
+  } catch (err) {
+    console.error('Entity update failed:', err);
+    await createLogEntry({
+      timestamp,
+      clientname,
+      appname,
+      stack,
+      appurl,
+      entityType,
+      event: 'entity_updated',
+      status: 'failure',
+      entityId,
+      error: err.message
+    });
+    res.status(500).json({ error: 'Failed to update entity', details: err.message });
+  }
+});
+
+app.delete('/entity/:id', validateJWT, async (req, res) => {
+  const { clientname, appname, stack } = req.headers;
+  const { entityType } = req.query;
+  const entityId = req.params.id;
+  const timestamp = new Date();
+
+  if (!entityType) {
+    return res.status(400).json({ error: 'entityType is required in query parameters' });
+  }
+
+  const indexName = getIndexName(clientname, appname, stack, entityType);
+
+  try {
+    const existingEntity = await opensearchClient.get({
+      index: indexName,
+      id: entityId
+    }).catch(() => null);
+
+    if (!existingEntity) {
+      return res.status(404).json({
+        error: 'Entity not found',
+        details: {
+          id: entityId,
+          suggestion: 'Please verify the entity ID and ensure it exists'
+        }
+      });
+    }
+
+    await opensearchClient.delete({
+      index: indexName,
+      id: entityId,
+      refresh: true
+    });
+
+    await createLogEntry({
+      timestamp,
+      clientname,
+      appname,
+      stack,
+      entityType,
+      event: 'entity_deleted',
+      status: 'success',
+      entityId
+    });
+
+    res.status(200).json({
+      message: 'Entity deleted successfully',
+      id: entityId
+    });
+  } catch (err) {
+    console.error('Entity deletion failed:', err);
+    await createLogEntry({
+      timestamp,
+      clientname,
+      appname,
+      stack,
+      entityType,
+      event: 'entity_deleted',
+      status: 'failure',
+      entityId,
+      error: err.message
+    });
+    res.status(500).json({
+      error: 'Failed to delete entity',
+      details: {
+        reason: err.message,
+        suggestion: 'Please try again or contact support if the problem persists'
+      }
+    });
+  }
+});
+
 app.post('/search', validateJWT, async (req, res) => {
   const { clientname, appname, stack, appurl } = req.headers;
-  // Remove includeAiInsights parameter
   const { query, filters = {}, entityType = 'default', topK = 100, minScore, fileType = 'text' } = req.body;
   const indexName = getIndexName(clientname, appname, stack, entityType);
   const timestamp = new Date();
@@ -353,15 +565,13 @@ app.post('/search', validateJWT, async (req, res) => {
     embedding = await createEmbedding(queryText);
     const validatedTopK = Math.min(Math.max(parseInt(topK) || 100, 1), 1000);
 
-    // Build filter conditions for metadata properties only
     const filterConditions = Object.entries(filters)
       .filter(([field, _]) => ['fileType', 'createdAt'].includes(field))
       .map(([field, value]) => {
         if (field === 'createdAt') {
-          // Handle date range filters
           return {
             range: {
-              createdAt: value // Expecting value to be an object like { gte: date1, lte: date2 }
+              createdAt: value
             }
           };
         }
@@ -401,7 +611,8 @@ app.post('/search', validateJWT, async (req, res) => {
       description: hit._source.description,
       previewUrl: hit._source.previewUrl,
       fileType: hit._source.fileType,
-      filePath: hit._source.filePath
+      filePath: hit._source.filePath,
+      text: hit._source.text // Include extracted text in search results
     }));
 
     await createLogEntry({
@@ -416,7 +627,6 @@ app.post('/search', validateJWT, async (req, res) => {
       event: 'search_success'
     });
 
-    // Prepare response without embedding
     const searchResponse = {
       query,
       topK: validatedTopK,
@@ -425,7 +635,6 @@ app.post('/search', validateJWT, async (req, res) => {
       results
     };
 
-    // Remove entire AI insights block
     res.status(200).json(searchResponse);
   } catch (err) {
     console.error('Search failed:', err);
@@ -444,9 +653,6 @@ app.post('/search', validateJWT, async (req, res) => {
   }
 });
 
-// -------------------
-// GET /logs
-// -------------------
 app.get('/logs', validateJWT, async (req, res) => {
   try {
     const { limit = 50, skip = 0, event, status, startDate, endDate } = req.query;
@@ -468,33 +674,133 @@ app.get('/logs', validateJWT, async (req, res) => {
   }
 });
 
-// -------------------
-// Start Server
-// -------------------
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 
-// Graceful shutdown on SIGINT
 process.on('SIGINT', async () => {
   await mongoClient.close();
   console.log('MongoDB connection closed');
   process.exit();
 });
 
-// Helper function to download and convert image to base64
 const downloadImage = async (imageUrl) => {
   try {
-    const response = await axios.get(imageUrl, { responseType: 'arraybuffer' });
-    const base64Image = Buffer.from(response.data, 'binary').toString('base64');
+    // Validate URL format before attempting download
+    if (!imageUrl || typeof imageUrl !== 'string' || !imageUrl.match(/^https?:\/\/.+/)) {
+      throw new Error('Invalid image URL format');
+    }
+
+    const response = await axios.get(imageUrl, {
+      responseType: 'arraybuffer',
+      timeout: 10000, // 10 second timeout
+      validateStatus: status => status === 200 // Only accept 200 OK responses
+    });
+
+    let imageBuffer = Buffer.from(response.data);
     const mimeType = response.headers['content-type'];
-    return `data:${mimeType};base64,${base64Image}`;
+
+    // Target ~3.5MB to account for base64 encoding overhead (3.5MB * 1.33 ≈ 4.65MB < 5MB)
+    const MAX_SIZE_BYTES = 3.5 * 1024 * 1024; // 3.5MB
+    const MAX_BASE64_BYTES = 5 * 1024 * 1024; // 5MB for Claude
+
+    // Function to check if base64 size is within limit
+    const getBase64Size = (buffer) => {
+      const base64String = buffer.toString('base64');
+      return { base64String, size: base64String.length * 0.75 }; // Approximate size in bytes
+    };
+
+    // Check if image size exceeds our limit
+    if (imageBuffer.length > MAX_SIZE_BYTES) {
+      console.log(`Resizing image from ${Math.round(imageBuffer.length / 1024 / 1024 * 100) / 100}MB to fit Claude's limit`);
+
+      let quality = 80;
+      let maxDimension = 1200;
+      let resizedImageBuffer = imageBuffer;
+
+      // Keep trying with lower quality and smaller dimensions until base64 size is under limit
+      while (quality >= 20 && maxDimension >= 600) {
+        try {
+          resizedImageBuffer = await sharp(imageBuffer)
+            .resize({
+              width: maxDimension,
+              height: maxDimension,
+              fit: 'inside',
+              withoutEnlargement: true
+            })
+            .jpeg({ quality, force: true }) // Always convert to JPEG
+            .toBuffer();
+
+          const { base64String, size } = getBase64Size(resizedImageBuffer);
+
+          // Check if base64-encoded size is under 5MB
+          if (size < MAX_BASE64_BYTES) {
+            console.log(`Successfully resized image to ${Math.round(resizedImageBuffer.length / 1024 / 1024 * 100) / 100}MB (base64: ${Math.round(size / 1024 / 1024 * 100) / 100}MB) with quality ${quality} and max dimension ${maxDimension}px`);
+            return `data:image/jpeg;base64,${base64String}`;
+          }
+
+          // Reduce quality and dimensions
+          quality -= 10;
+          maxDimension -= 200;
+
+          console.log(`Base64 size ${Math.round(size / 1024 / 1024 * 100) / 100}MB still too large, trying quality=${quality}, maxDimension=${maxDimension}`);
+        } catch (resizeError) {
+          console.error('Error during image resize:', resizeError);
+          throw new Error(`Failed to resize image: ${resizeError.message}`);
+        }
+      }
+
+      // Final attempt with aggressive settings
+      console.log('Still too large, attempting final extreme resize');
+      try {
+        resizedImageBuffer = await sharp(imageBuffer)
+          .resize({ width: 400, height: 400, fit: 'inside' })
+          .jpeg({ quality: 20, force: true })
+          .toBuffer();
+
+        const { base64String, size } = getBase64Size(resizedImageBuffer);
+        if (size >= MAX_BASE64_BYTES) {
+          throw new Error(`Unable to resize image below 5MB limit. Final base64 size: ${Math.round(size / 1024 / 1024 * 100) / 100}MB`);
+        }
+        console.log(`Final resize successful: ${Math.round(resizedImageBuffer.length / 1024 / 1024 * 100) / 100}MB (base64: ${Math.round(size / 1024 / 1024 * 100) / 100}MB)`);
+        return `data:image/jpeg;base64,${base64String}`;
+      } catch (finalResizeError) {
+        throw new Error(`Failed final resize attempt: ${finalResizeError.message}`);
+      }
+    }
+
+    // For images already under the limit, check base64 size
+    const { base64String, size } = getBase64Size(imageBuffer);
+    if (size > MAX_BASE64_BYTES) {
+      console.log(`Image under limit but base64 encoding (${Math.round(size / 1024 / 1024 * 100) / 100}MB) exceeds Claude's limit. Resizing...`);
+      try {
+        const resizedImageBuffer = await sharp(imageBuffer)
+          .resize({ width: 1000, height: 1000, fit: 'inside' })
+          .jpeg({ quality: 70, force: true })
+          .toBuffer();
+
+        const { base64String: resizedBase64, size: resizedSize } = getBase64Size(resizedImageBuffer);
+        if (resizedSize >= MAX_BASE64_BYTES) {
+          throw new Error(`Resized base64 size still too large: ${Math.round(resizedSize / 1024 / 1024 * 100) / 100}MB`);
+        }
+        return `data:image/jpeg;base64,${resizedBase64}`;
+      } catch (resizeError) {
+        throw new Error(`Failed to resize image for base64 limit: ${resizeError.message}`);
+      }
+    }
+
+    return `data:${mimeType};base64,${base64String}`;
   } catch (error) {
     console.error('Image download failed:', error);
-    throw new Error(`Failed to download image: ${error.message}`);
+    if (error.response) {
+      throw new Error(`Failed to download image: Server returned ${error.response.status} ${error.response.statusText}`);
+    } else if (error.request) {
+      throw new Error(`Failed to download image: No response received from server`);
+    } else {
+      throw new Error(`Failed to download image: ${error.message}`);
+    }
   }
 };
 
-// Helper function to analyze image with Claude
 const analyzeImageWithClaude = async (imageData) => {
   try {
     const command = new InvokeModelCommand({
@@ -534,5 +840,3 @@ const analyzeImageWithClaude = async (imageData) => {
     throw new Error(`Failed to analyze image with Claude: ${error.message}`);
   }
 };
-
-// -------------------
